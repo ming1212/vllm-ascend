@@ -15,7 +15,7 @@
 # This file is a part of the vllm-ascend project.
 #
 
-name: 'ascend test / doctest'
+name: Doc Test
 
 on:
   workflow_dispatch:
@@ -23,9 +23,10 @@ on:
     branches:
       - 'main'
       - '*-dev'
+      - 'releases/v*'
     paths:
       # If we are changing the doctest we should do a PR test
-      - '.github/workflows/vllm_ascend_doctest.yaml'
+      - '.github/workflows/labled_doctest.yaml'
       - 'tests/e2e/doctests/**'
       - 'tests/e2e/common.sh'
       - 'tests/e2e/run_doctests.sh'

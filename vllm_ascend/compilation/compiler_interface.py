@@ -26,8 +26,10 @@ from torch._inductor.compile_fx import (graph_returns_tuple,
 from torch._inductor.decomposition import select_decomp_table
 from torch.fx import GraphModule
 from vllm.compilation.compiler_interface import CompilerInterface
+from vllm.config.utils import Range
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.utils import COMPILATION_PASS_KEY
 
 
 def compile_fx(graph: GraphModule, example_inputs: list,
@@ -46,13 +48,13 @@ def fusion_pass_compile(
     graph: fx.GraphModule,
     example_inputs: list[Any],
     compiler_config: dict[str, Any],
-    runtime_shape: Optional[int] = None,
+    compile_range: Range,
     key: Optional[str] = None,
 ) -> tuple[Optional[Callable], Optional[Any]]:
 
     def compile_inner(graph, example_inputs):
-        current_pass_manager = compiler_config["graph_fusion_manager"]
-        graph = current_pass_manager(graph, runtime_shape)
+        current_pass_manager = compiler_config[COMPILATION_PASS_KEY]
+        graph = current_pass_manager(graph)
         return graph
 
     decompositions = select_decomp_table()
@@ -71,7 +73,7 @@ def npugraph_ex_compile(
     graph: fx.GraphModule,
     example_inputs: list[Any],
     compiler_config: dict[str, Any],
-    runtime_shape: Optional[int] = None,
+    compile_range: Range,
     key: Optional[str] = None,
 ) -> tuple[Optional[Callable], Optional[Any]]:
     # When currently using the FULL_DECODE_ONLY mode,
@@ -89,13 +91,13 @@ def npugraph_ex_compile(
                                               tuple,
                                               args=([return_value], ))
         output_node.args = (tuple_node, )
-        fx_graph.recompile()
+        graph.recompile()
 
     import torchair
 
     # TODO: use a better way to lazy register replacement, instead of import one by one
     # As an example, we directly import here to register replacement.
-    import vllm_ascend.compilation.npugraph_ex_passes.add_rms_norm_quant  # noqa
+    # import vllm_ascend.compilation.npugraph_ex_passes.add_rms_norm_quant  # noqa
 
     torch.npu.set_compile_mode(jit_compile=False)
     config = torchair.CompilerConfig()
@@ -124,14 +126,14 @@ class AscendCompiler(CompilerInterface):
         graph: fx.GraphModule,
         example_inputs: list[Any],
         compiler_config: dict[str, Any],
-        runtime_shape: Optional[int] = None,
+        compile_range: Range,
         key: Optional[str] = None,
     ) -> tuple[Optional[Callable], Optional[Any]]:
 
         ascend_config = get_ascend_config()
         if ascend_config.enable_npugraph_ex:
             return npugraph_ex_compile(graph, example_inputs, compiler_config,
-                                       runtime_shape, key)
+                                       compile_range, key)
         else:
             return fusion_pass_compile(graph, example_inputs, compiler_config,
-                                       runtime_shape, key)
+                                       compile_range, key)

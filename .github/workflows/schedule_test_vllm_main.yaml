@@ -14,12 +14,12 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-name: 'ascend test / vllm main'
+name: vLLM Main Schedule Test
 
 on:
-  # Run full e2e tests per 4h
+  # Run full e2e tests UTC+8: 10am, 16pm, 22pm, 4am
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '0 2,8,14,20 * * *'
   workflow_dispatch:
 
 # Bash shells do not use ~/.profile or ~/.bashrc so these shells need to be explicitly

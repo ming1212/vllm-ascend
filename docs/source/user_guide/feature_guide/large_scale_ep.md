@@ -7,12 +7,12 @@ Take the deepseek model as an example, use 8 Atlas 800T A3 servers to deploy the
 
 ## Verify Multi-Node Communication Environment
 
-### Physical Layer Requirements:
+### Physical Layer Requirements
 
 - The physical machines must be located on the same WLAN, with network connectivity.
 - All NPUs must be interconnected. For the Atlas A2 generation, intra-node connectivity is via HCCS, and inter-node connectivity is via RDMA. For the Atlas A3 generation, both intra-node and inter-node connectivity are via HCCS.
 
-### Verification Process:
+### Verification Process
 
 :::::{tab-set}
 ::::{tab-item} A3
@@ -158,13 +158,12 @@ vllm serve vllm-ascend/DeepSeek-R1-W8A8 \
     --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
     --enforce-eager \
     --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnector",
+    '{"kv_connector": "MooncakeConnectorV1",
       "kv_buffer_device": "npu",
       "kv_role": "kv_producer",
       "kv_parallel_size": "1",
       "kv_port": "20001",
-      "engine_id": "0",
-      "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector"
+      "engine_id": "0"
     }'
     --additional-config '{"enable_weight_nz_layout":true,"enable_prefill_optimizations":true}'
 ```
@@ -225,13 +224,12 @@ vllm serve vllm-ascend/DeepSeek-R1-W8A8 \
     --quantization ascend \
     --speculative-config '{"num_speculative_tokens": 1, "method":"deepseek_mtp"}' \
     --kv-transfer-config \
-        '{"kv_connector": "MooncakeConnector",
+        '{"kv_connector": "MooncakeConnectorV1",
         "kv_buffer_device": "npu",
         "kv_role": "kv_consumer",
         "kv_parallel_size": "1",
         "kv_port": "20001",
-        "engine_id": "0",
-        "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector"
+        "engine_id": "0"
         }' \
     --additional-config '{"enable_weight_nz_layout":true}'
 ```
@@ -430,13 +428,12 @@ In the PD separation scenario, we provide a optimized configuration.
 
 ```shell
 --kv-transfer-config \
-    '{"kv_connector": "MooncakeConnector",
+    '{"kv_connector": "MooncakeConnectorV1",
       "kv_buffer_device": "npu",
       "kv_role": "kv_producer",
       "kv_parallel_size": "1",
       "kv_port": "20001",
-      "engine_id": "0",
-      "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector"
+      "engine_id": "0"
     }'
 ```
 
@@ -453,13 +450,12 @@ In the PD separation scenario, we provide a optimized configuration.
 
 ```shell
 --kv-transfer-config
-    '{"kv_connector": "MooncakeConnector",
+    '{"kv_connector": "MooncakeConnectorV1",
       "kv_buffer_device": "npu",
       "kv_role": "kv_consumer",
       "kv_parallel_size": "1",
       "kv_port": "20001",
-      "engine_id": "0",
-      "kv_connector_module_path": "vllm_ascend.distributed.mooncake_connector"
+      "engine_id": "0"
     }'
 ```
 

@@ -15,11 +15,13 @@
 # This file is a part of the vllm-ascend project.
 #
 
-import gc
+import math
 import os
-from typing import TYPE_CHECKING, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Optional
+from uuid import uuid4
 
 import torch
+import vllm.envs as envs_vllm
 from vllm.logger import logger
 from vllm.platforms import Platform, PlatformEnum
 
@@ -27,15 +29,14 @@ from vllm.platforms import Platform, PlatformEnum
 os.environ["VLLM_DISABLE_SHARED_EXPERTS_STREAM"] = "1"
 
 from vllm_ascend.ascend_config import init_ascend_config
-from vllm_ascend.utils import refresh_block_size
 
 # isort: off
-from vllm_ascend.utils import (ASCEND_QUANTIZATION_METHOD,
-                               COMPRESSED_TENSORS_METHOD, AscendDeviceType,
-                               enable_sp, get_ascend_device_type, is_vl_model,
-                               update_aclgraph_sizes,
-                               update_cudagraph_capture_sizes,
-                               update_default_aclgraph_sizes)
+from vllm_ascend.utils import (
+    ASCEND_QUANTIZATION_METHOD, COMPILATION_PASS_KEY,
+    COMPRESSED_TENSORS_METHOD, AscendDeviceType, check_kv_extra_config,
+    enable_sp, flashcomm2_enable, get_ascend_device_type, is_moe_model,
+    is_vl_model, refresh_block_size, update_aclgraph_sizes,
+    update_cudagraph_capture_sizes, update_default_aclgraph_sizes)
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
@@ -45,7 +46,37 @@ else:
     VllmConfig = None
     FlexibleArgumentParser = None
 
-CUSTOM_OP_REGISTERED = False
+_CUSTOM_OP_REGISTERED = False
+
+
+def config_deprecated_logging():
+    """Configure deprecated logging format, when used deprecated codes
+    in vllm-ascend.
+    """
+    import logging
+    import warnings
+
+    # Customize warning format to be one line
+    def one_line_formatwarning(message, category, filename, lineno, line=None):
+        return f"{filename}:{lineno}: {category.__name__}: {message}"
+
+    warnings.formatwarning = one_line_formatwarning
+
+    logging.captureWarnings(True)
+    warnings.simplefilter("once", DeprecationWarning)
+
+    vllm_logger = logging.getLogger("vllm")
+    warnings_logger = logging.getLogger("py.warnings")
+
+    # Propagate vllm logger handlers to warnings logger, to keep the same
+    # format with vllm
+    if vllm_logger.handlers:
+        warnings_logger.handlers = []
+
+        for handler in vllm_logger.handlers:
+            warnings_logger.addHandler(handler)
+
+    warnings_logger.propagate = False
 
 
 class NPUPlatform(Platform):
@@ -72,7 +103,7 @@ class NPUPlatform(Platform):
         It is a parameter of inductor_config used to register custom passes.
         Currently, we only use Inductor's 'pattern matcher' functionality, so we define our own pass_key.
         """
-        return "graph_fusion_manager"
+        return COMPILATION_PASS_KEY
 
     @classmethod
     def get_pass_manager_cls(cls) -> str:
@@ -113,6 +144,8 @@ class NPUPlatform(Platform):
         from vllm_ascend.quantization.quant_config import \
             AscendQuantConfig  # noqa: F401
 
+        config_deprecated_logging()
+
     @classmethod
     def get_device_capability(cls, device_id: int = 0):
         return None
@@ -130,28 +163,16 @@ class NPUPlatform(Platform):
         torch.npu.set_device(device)
 
     @classmethod
-    def empty_cache(cls):
-        torch.npu.empty_cache()
-
-    @classmethod
-    def synchronize(cls):
-        torch.npu.synchronize()
-
-    @classmethod
-    def mem_get_info(cls) -> Tuple[int, int]:
-        return torch.npu.mem_get_info()
-
-    @classmethod
-    def clear_npu_memory(cls):
-        gc.collect()
-        torch.npu.empty_cache()
-        torch.npu.reset_peak_memory_stats()
-
-    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         # initialize ascend config from vllm additional_config
         ascend_config = init_ascend_config(vllm_config)
 
+        if vllm_config.kv_transfer_config is not None:
+            check_kv_extra_config(vllm_config)
+            if not getattr(vllm_config.kv_transfer_config,
+                           "_engine_id_patched", False):
+                vllm_config.kv_transfer_config.engine_id = f"{vllm_config.kv_transfer_config.engine_id}-{uuid4().hex}"
+                vllm_config.kv_transfer_config._engine_id_patched = True
         from vllm.config import CompilationMode  # noqa: E402
 
         compilation_config = vllm_config.compilation_config
@@ -166,11 +187,8 @@ class NPUPlatform(Platform):
                          ) if not isinstance(ascend_compilation_config, dict)
                     else ascend_compilation_config)
 
-        kv_cache_dtype = vllm_config.additional_config.get(
-            "kv_cache_dtype", None)
-        if kv_cache_dtype is not None:
-            vllm_config.cache_config.cache_dtype = kv_cache_dtype
-        elif model_config and hasattr(model_config.hf_config, "index_topk"):
+        elif model_config and hasattr(model_config.hf_text_config,
+                                      "index_topk"):
             vllm_config.cache_config.cache_dtype = str(
                 model_config.dtype).replace("torch.", "")
         if model_config is None:
@@ -188,8 +206,6 @@ class NPUPlatform(Platform):
                 compilation_config.splitting_ops = []
 
         compilation_config.cudagraph_num_of_warmups = 1
-        compilation_config.pass_config.fuse_norm_quant = False
-        compilation_config.pass_config.fuse_act_quant = False
 
         if compilation_config.mode not in [
                 CompilationMode.NONE, CompilationMode.VLLM_COMPILE
@@ -224,6 +240,14 @@ class NPUPlatform(Platform):
         if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_AND_PIECEWISE:
             compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
 
+        # encoder-decoder models currently only support piecewise mode
+        if model_config and model_config.is_encoder_decoder is True:
+            if compilation_config.cudagraph_mode == CUDAGraphMode.FULL_DECODE_ONLY:
+                logger.warning(
+                    "encoder-decoder model doesn't support FULL_DECODE_ONLY, fallback to PIECEWISE "
+                )
+            compilation_config.cudagraph_mode = CUDAGraphMode.PIECEWISE
+
         # get custom compile backend for graph fusion
         compilation_config.oot_compiler = cls.get_compile_backend()
 
@@ -236,8 +260,18 @@ class NPUPlatform(Platform):
                 "using only ACL Graph mode")
             assert compilation_config.mode == CompilationMode.VLLM_COMPILE, \
                 "When enabling VLLM_COMPILE aclgraph, please make sure compilation_config.mode == CompilationMode.VLLM_COMPILE and compilation_config.cudagraph_mode == CUDAGraphMode.VLLM_COMPILE"
-            compilation_config.set_splitting_ops_for_v1()
+            compilation_config.set_splitting_ops_for_v1(
+                all2all_backend=vllm_config.parallel_config.all2all_backend,
+                data_parallel_size=vllm_config.parallel_config.
+                data_parallel_size,
+            )
             compilation_config.use_inductor = False
+            # NOTE: Theoretically, we should also add vllm::mla_forward in the attention ops.
+            # Since the process is created in the spawn mode, the value of the class attribute
+            # attention ops transmitted is still the one before modification, so it has not been modified.
+            # This will cause in scenarios where both piecewise and splitting ops are configured simultaneously,
+            # If splitting ops does not contain the vllm::mla forward value, this configuration issue will
+            # not be detected in advance assert.
             compilation_config.splitting_ops.extend(["vllm::mla_forward"])
             update_aclgraph_sizes(vllm_config)
             ascend_config.enable_npugraph_ex = False
@@ -285,11 +319,11 @@ class NPUPlatform(Platform):
             parallel_config.all2all_backend = "flashinfer_all2allv"
             if ascend_config.xlite_graph_config.enabled:
                 logger.info(
-                    "Euler Xlite enabled. See: https://gitee.com/openeuler/GVirt/tree/master/xlite"
+                    "openEuler Xlite enabled. See: https://atomgit.com/openeuler/GVirt/tree/master/xlite"
                 )
                 parallel_config.worker_cls = "vllm_ascend.xlite.xlite_worker.XliteWorker"
             else:
-                parallel_config.worker_cls = "vllm_ascend.worker.worker_v1.NPUWorker"
+                parallel_config.worker_cls = "vllm_ascend.worker.worker.NPUWorker"
 
         refresh_block_size(vllm_config)
 
@@ -298,7 +332,8 @@ class NPUPlatform(Platform):
             compilation_config.custom_ops = ["all"]
 
         if ascend_config.recompute_scheduler_enable:
-            from vllm_ascend.core.recompute_scheduler import RecomputeSchedulerConfig
+            from vllm_ascend.core.recompute_scheduler import \
+                RecomputeSchedulerConfig
             recompute_scheduler_config = RecomputeSchedulerConfig.initialize_from_config(
                 vllm_config)
             vllm_config.scheduler_config = recompute_scheduler_config
@@ -317,7 +352,7 @@ class NPUPlatform(Platform):
             raise AssertionError(
                 f"cp_kv_cache_interleave_size({parallel_config.cp_kv_cache_interleave_size}) "
                 f"and block_size({cache_config.block_size}) "
-                "needs to be equal if use cp or dcp > 1 in P/D disaggregate scenario."
+                "needs to be equal if use pcp or dcp > 1 in P/D disaggregate and kv pool scenario."
             )
 
         if is_vl_model(vllm_config):
@@ -338,8 +373,8 @@ class NPUPlatform(Platform):
         # from vllm_ascend.utils import enable_custom_op
         # enable_custom_op()
         # set custom ops path
-        global CUSTOM_OP_REGISTERED
-        if CUSTOM_OP_REGISTERED:
+        global _CUSTOM_OP_REGISTERED
+        if _CUSTOM_OP_REGISTERED:
             return
         CUR_DIR = os.path.dirname(os.path.realpath(__file__))
         CUSTOM_OPP_PATH = os.path.join(CUR_DIR, "_cann_ops_custom", "vendors",
@@ -352,25 +387,19 @@ class NPUPlatform(Platform):
                     "ASCEND_CUSTOM_OPP_PATH"] = f"{CUSTOM_OPP_PATH}:{current_cust_opp_path}"
             else:
                 os.environ["ASCEND_CUSTOM_OPP_PATH"] = CUSTOM_OPP_PATH
-        CUSTOM_OP_REGISTERED = True
+        _CUSTOM_OP_REGISTERED = True
 
     @classmethod
-    def get_attn_backend_cls(cls, selected_backend, *args, **kwargs):
-        if "attn_selector_config" in kwargs:
-            use_mla = kwargs["attn_selector_config"].use_mla
-            use_sparse = kwargs["attn_selector_config"].use_sparse
-        else:
-            use_mla = kwargs.get("use_mla",
-                                 args[4] if len(args) >= 5 else None)
-            use_sparse = kwargs.get("use_sparse",
-                                    args[6] if len(args) >= 7 else None)
+    def get_attn_backend_cls(cls, selected_backend, attn_selector_config):
         backend_map = {
             (True, False): "vllm_ascend.attention.mla_v1.AscendMLABackend",
             (False, False):
             "vllm_ascend.attention.attention_v1.AscendAttentionBackend",
             (True, True): "vllm_ascend.attention.sfa_v1.AscendSFABackend",
         }
-        return backend_map[(use_mla, use_sparse)]
+
+        return backend_map[(attn_selector_config.use_mla,
+                            attn_selector_config.use_sparse)]
 
     @classmethod
     def get_punica_wrapper(cls) -> str:
@@ -385,7 +414,7 @@ class NPUPlatform(Platform):
 
     @classmethod
     def get_device_communicator_cls(cls) -> str:
-        return "vllm_ascend.distributed.communicator.NPUCommunicator"
+        return "vllm_ascend.distributed.device_communicators.npu_communicator.NPUCommunicator"
 
     @classmethod
     def is_pin_memory_available(cls):
@@ -409,3 +438,134 @@ class NPUPlatform(Platform):
     @classmethod
     def support_static_graph_mode(cls) -> bool:
         return True
+
+    @classmethod
+    def set_additional_forward_context(
+        cls,
+        attn_metadata: dict[str, Any],
+        vllm_config: VllmConfig,
+        dp_metadata,
+        virtual_engine: int = 0,
+        num_tokens: int | None = None,
+        num_tokens_across_dp: torch.Tensor | None = None,
+        cudagraph_runtime_mode=None,
+        batch_descriptor=None,
+        ubatch_slices=None,
+    ) -> dict[str, Any]:
+        """set additional forward context for ascend npus.
+
+        Args:
+            attn_metadata (dict[str, Any]): attention metadata for all layers.
+            vllm_config (VllmConfig): configuration of vllm.
+            dp_metadata (DpMetada): metadata for data parallelism. 
+                lack of typehint because of circular import.
+            virtual_engine (int, optional): index of virtual engine. Defaults to 0.
+            num_tokens (int | None, optional): number of tokens. Defaults to None.
+            num_tokens_across_dp (torch.Tensor | None, optional): number of tokens 
+                across data parallelism.Defaults to None.
+            cudagraph_runtime_mode (CUDAGraphMode, optional): mode of cudagraph runtime.
+                Defaults to None.lack of typehint because of circular import.
+            batch_descriptor (BatchDescriptor, optional): descriptor of batch.
+                Defaults to None.
+            ubatch_slices (UBatchSlices, optional): slice info for dual batch. 
+                Defaults to None. lack of typehint because of circular import
+
+        Returns:
+            dict[str, Any]: _description_
+        """
+        # NOTE(Ronald1995): avoid circular import.
+        from vllm_ascend.ascend_forward_context import (get_mc2_mask,
+                                                        select_moe_comm_method)
+        from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method
+        from vllm.distributed import get_dp_group, get_tensor_model_parallel_world_size
+        # NOTE(Ronald1995): avoid circular import, cudagraph_runtime_mode is
+        # CUDAGraphMode.NONE in vllm, but we can't set CUDAGraphMode.NONE in
+        # argument default value, so we set it to None first, then set it to
+        # CUDAGraphMode.NONE here.
+        from vllm.config import CUDAGraphMode
+        if cudagraph_runtime_mode is None:
+            cudagraph_runtime_mode = CUDAGraphMode.NONE
+        # TODO(Ronald1995): model runner v1 still use ascend_forward_context,
+        # when v1's forward context is refactored, we can remove this branch.
+        # Currently, model runner v2 use the new forward context.
+        # compared to v1, v2's forward context lacks some fields, such as:
+        # in_profile_run, is_first_layer, prefetch_mlp_gate_up_proj,
+        # prefetch_mlp_gate_down_proj, prefetch_mlp_enabled, model_instance,
+        # is_draft_model.
+        if not envs_vllm.VLLM_USE_V2_MODEL_RUNNER:
+            return {}
+
+        num_actual_tokens = list(attn_metadata.values())[0].num_actual_tokens
+        if num_tokens is None:
+            num_tokens = num_actual_tokens
+
+        moe_comm_type = select_moe_comm_method(
+            num_tokens,
+            vllm_config,
+            # is_draft_model will be removed later, so we set it to False temporarily.
+            is_draft_model=False,
+        )
+        moe_comm_method = get_moe_comm_method(moe_comm_type)
+
+        tp_world_size = get_tensor_model_parallel_world_size()
+
+        # NOTE: This cannot be set using set_forward_context
+        # due to multiple warmups before actual capturing.
+        capturing = False
+
+        # set for sequence parallelism, 1000 is the batch size concurrency
+        # threshold for enabling the flashcomm_v1 or sequence_parallelism feature.
+        # Currently, it is an empirical value. In normal scenarios,
+        # if the concurrency exceeds this threshold,
+        # the performance benefits can be maximized. Conversely,
+        # if the concurrency is below the threshold,
+        # the performance may degrade due to the switching of
+        # communication methods.
+        mmrs_fusion = True
+        if is_moe_model(vllm_config):
+            sp_enabled = enable_sp(vllm_config) and num_tokens is not None
+            mmrs_fusion = False
+        else:
+            sp_enabled = enable_sp(vllm_config) and \
+                num_tokens is not None and num_tokens > 1000
+
+        # TODO(Levi-JQ): another PR to normalize the enabling logic for sp/fc2
+        flashcomm_v2_enabled = flashcomm2_enable(
+        ) and tp_world_size > 1 and num_tokens is not None
+        pad_size = 0
+        if (sp_enabled or flashcomm_v2_enabled):
+            pad_size = (tp_world_size -
+                        (num_tokens % tp_world_size)) % tp_world_size
+
+        dp_world_size = get_dp_group().world_size
+        if dp_world_size > 1 and dp_metadata is not None:
+            max_tokens_across_dp = dp_metadata.max_tokens_across_dp_cpu.item()
+            if (sp_enabled or flashcomm_v2_enabled):
+                padded_length = (max_tokens_across_dp + tp_world_size -
+                                 1) // tp_world_size * tp_world_size
+                pad_size = padded_length - num_tokens
+        else:
+            max_tokens_across_dp = num_tokens
+
+        if num_tokens is not None:
+            # NOTE: token num which need to pad to when mc2
+            padded_num_tokens = math.ceil(
+                max_tokens_across_dp / tp_world_size) * tp_world_size
+            reserved_mc2_mask = get_mc2_mask()
+            if reserved_mc2_mask is not None:
+                mc2_mask = reserved_mc2_mask[:padded_num_tokens]
+                mc2_mask[:num_actual_tokens] = True
+                mc2_mask[num_actual_tokens:] = False
+        return {
+            "moe_comm_type": moe_comm_type,
+            "moe_comm_method": moe_comm_method,
+            "capturing": capturing,
+            "mmrs_fusion": mmrs_fusion,
+            "num_tokens": num_tokens,
+            "sp_enabled": sp_enabled,
+            "flashcomm_v2_enabled": flashcomm_v2_enabled,
+            "pad_size": pad_size,
+            "padded_length": padded_length,
+            "max_tokens_across_dp": max_tokens_across_dp,
+            "mc2_mask": mc2_mask,
+        }
